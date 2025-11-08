@@ -2,85 +2,74 @@ import os
 import re
 import requests
 from flask import Flask, request
-from signalwire.rest import Client as SignalWireClient
+from twilio.rest import Client as TwilioClient
+from urllib.parse import urljoin
 
 app = Flask(__name__)
 
 # =========================
-#   إعدادات من Environment
+#   متغيرات البيئة (Render)
 # =========================
-SW_PROJECT   = os.getenv("SIGNALWIRE_PROJECT")
-SW_TOKEN     = os.getenv("SIGNALWIRE_TOKEN")
-SW_SPACE_URL = os.getenv("SIGNALWIRE_SPACE_URL")   # مثال: https://yourspace.signalwire.com
-SW_FROM      = os.getenv("SIGNALWIRE_NUMBER")      # رقم SignalWire بصيغة دولية +1...
-TG_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN")
-TG_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN  = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_NUMBER      = os.getenv("TWILIO_NUMBER")      # مثال: +1415xxxxxxx (رقم Twilio)
+TG_TOKEN           = os.getenv("TELEGRAM_BOT_TOKEN")
+TG_CHAT_ID         = os.getenv("TELEGRAM_CHAT_ID")
 
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}" if TG_TOKEN else ""
 
-# تحويل الأرقام العربية إلى إنجليزية
+# تحويل أرقام عربية لإنجليزية
 AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
 def send_tg(text: str):
     try:
         if TG_API and TG_CHAT_ID:
-            requests.post(f"{TG_API}/sendMessage", data={"chat_id": TG_CHAT_ID, "text": text})
+            requests.post(f"{TG_API}/sendMessage",
+                          data={"chat_id": TG_CHAT_ID, "text": text})
     except Exception:
         pass
-
-def missing_env():
-    req = {
-        "SIGNALWIRE_PROJECT": SW_PROJECT,
-        "SIGNALWIRE_TOKEN": SW_TOKEN,
-        "SIGNALWIRE_SPACE_URL": SW_SPACE_URL,
-        "SIGNALWIRE_NUMBER": SW_FROM,
-        "TELEGRAM_BOT_TOKEN": TG_TOKEN,
-        "TELEGRAM_CHAT_ID": TG_CHAT_ID,
-    }
-    return [k for k, v in req.items() if not v]
-
-def get_sw_client():
-    # مكتبة signalwire تقرأ SIGNALWIRE_SPACE_URL من البيئة تلقائيًا
-    return SignalWireClient(SW_PROJECT, SW_TOKEN)
 
 def to_e164(user_input: str, default_cc="+20"):
     """
     يطبع الرقم لصيغة E.164:
     - يشيل مسافات/شرطات/أقواس
     - يحوّل أرقام عربية لإنجليزية
-    - يتعامل مع 00 / + / 0 المحلية (لمصر +20 كافتراضي)
+    - يتعامل مع + / 00 / 0 المحلية (لمصر +20 كافتراضي)
     """
     if not user_input:
         return None
-    s = user_input.strip().translate(AR_DIGITS)
-    # شيل أي شيء غير + أو أرقام
+    s = (user_input or "").strip().translate(AR_DIGITS)
     s = re.sub(r"[^\d+]", "", s)
 
-    # لو بدأ بـ + وخلاص
     if s.startswith("+"):
         return s
-
-    # لو بدأ بـ 00.. حوّل لأول + ثم باقي الأرقام
     if s.startswith("00"):
         return "+" + s[2:]
-
-    # لو رقم محلي يبدأ بصفر (مثلاً 01xxxxxxxxx في مصر)
     if s.startswith("0"):
         return default_cc + s[1:]
-
-    # لو أرقام فقط بدون + ولا 00 (نعتبره محلي لمصر)
     if re.fullmatch(r"\d+", s):
-        # لو بيبدأ بـ1 ومكوَّن من 10 أو 11 رقم، نخمن مصر موبايل: ضيف +20
         return default_cc + s
-
     return None
+
+def missing_env():
+    req = {
+        "TWILIO_ACCOUNT_SID": TWILIO_ACCOUNT_SID,
+        "TWILIO_AUTH_TOKEN": TWILIO_AUTH_TOKEN,
+        "TWILIO_NUMBER": TWILIO_NUMBER,
+        "TELEGRAM_BOT_TOKEN": TG_TOKEN,
+        "TELEGRAM_CHAT_ID": TG_CHAT_ID,
+    }
+    return [k for k, v in req.items() if not v]
+
+def twilio():
+    return TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 @app.route("/")
 def home():
     miss = missing_env()
     if miss:
         return f"Running, but missing env vars: {', '.join(miss)}", 500
-    return "SignalWire + Telegram Bot is Running ✅", 200
+    return "Twilio + Telegram Bot is Running ✅", 200
 
 # =========================
 #   Webhook تيليجرام
@@ -109,22 +98,25 @@ def telegram_webhook():
             send_tg("📞 اكتب بالشكل: /call 01xxxxxxxxx أو /call +2010xxxxxxx")
             return "ok"
 
-        # طبّع الرقم لصيغة دولية
         raw = parts[1]
-        to_number = to_e164(raw, default_cc="+20")
+        to_number = to_e164(raw, default_cc="+20")  # غيّر +20 لو محتاج بلد افتراضية أخرى
         if not to_number or not to_number.startswith("+"):
             send_tg(f"❌ الرقم غير صحيح: {raw}\nجرّب بالشكل: +2010xxxxxxx أو 01xxxxxxxxx")
             return "ok"
 
-        base = request.host_url.rstrip('/')
+        base = request.host_url  # مثل https://your-app.onrender.com/
+        voice_url      = urljoin(base, "voice/outbound-start")
+        status_cb_url  = urljoin(base, "voice/status")
+
         try:
-            client = get_sw_client()
-            call = client.calls.create(
-                from_=SW_FROM,
+            call = twilio().calls.create(
+                from_=TWILIO_NUMBER,
                 to=to_number,
-                url=f"{base}/voice/outbound-start",
-                status_callback=f"{base}/voice/status",
-                method="POST"
+                url=voice_url,                       # TwiML لبداية المكالمة
+                method="POST",                       # نستخدم POST
+                status_callback=status_cb_url,       # إشعارات الحالة
+                status_callback_method="POST",
+                status_callback_event=["initiated", "ringing", "answered", "completed"]
             )
             send_tg(f"📤 بدء مكالمة مع {to_number}\nCallSid: {call.sid}")
         except Exception as e:
@@ -134,14 +126,16 @@ def telegram_webhook():
     return "ok"
 
 # =========================
-#   تدفق المكالمة (cXML/TwiML)
+#   تدفق المكالمة (TwiML)
 # =========================
 @app.route("/voice/outbound-start", methods=["POST"])
 def outbound_start():
-    base = request.host_url.rstrip('/')
-    return f"""<Response>
+    base = request.host_url
+    gather_url = urljoin(base, "voice/gather")
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
   <Say language="ar-EG">مرحبًا، شكرًا لاتصالك. اضغط واحد لرسالة النادي، أو اثنين لرسالة الشركة.</Say>
-  <Gather input="dtmf speech" timeout="5" numDigits="1" action="{base}/voice/gather" method="POST" />
+  <Gather input="dtmf speech" timeout="5" numDigits="1" action="{gather_url}" method="POST" />
 </Response>"""
 
 @app.route("/voice/gather", methods=["POST"])
@@ -153,14 +147,15 @@ def gather():
     if digits:
         send_tg(f"👆 المتصل اختار: {digits}\nCallSid: {sid}")
         if digits == "1":
-            return """<Response><Say language="ar-EG">هذه رسالة النادي. شكرًا لاتصالك.</Say></Response>"""
-        elif digits == "2":
-            return """<Response><Say language="ar-EG">هذه رسالة الشركة. شكرًا لاتصالك.</Say></Response>"""
+            return """<?xml version="1.0" encoding="UTF-8"?><Response><Say language="ar-EG">هذه رسالة النادي. شكرًا لاتصالك.</Say></Response>"""
+        if digits == "2":
+            return """<?xml version="1.0" encoding="UTF-8"?><Response><Say language="ar-EG">هذه رسالة الشركة. شكرًا لاتصالك.</Say></Response>"""
 
     if speech:
         send_tg(f"🗣️ المتصل قال: {speech}\nCallSid: {sid}")
 
-    return """<Response>
+    return """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
   <Say language="ar-EG">شكرًا. سيتم إنهاء المكالمة الآن.</Say>
   <Hangup/>
 </Response>"""
@@ -168,13 +163,26 @@ def gather():
 @app.route("/voice/status", methods=["POST"])
 def status():
     sid   = request.form.get("CallSid")
-    st    = request.form.get("CallStatus")
+    st    = request.form.get("CallStatus")  # queued, ringing, in-progress, completed, busy, failed, no-answer...
     frm   = request.form.get("From")
     to    = request.form.get("To")
     send_tg(f"📊 حالة المكالمة: {st}\nFrom: {frm}\nTo: {to}\nCallSid: {sid}")
     return "ok"
 
-# للتشغيل المحلي فقط
+# (اختياري) للمكالمات الواردة من رقم Twilio
+@app.route("/voice/incoming", methods=["POST"])
+def incoming():
+    base = request.host_url
+    gather_url = urljoin(base, "voice/gather")
+    frm = request.form.get("From")
+    sid = request.form.get("CallSid")
+    send_tg(f"📞 اتصال وارد من: {frm}\nCallSid: {sid}")
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say language="ar-EG">مرحبًا بك. اضغط واحد لرسالة النادي، أو اثنين لرسالة الشركة.</Say>
+  <Gather input="dtmf speech" timeout="5" numDigits="1" action="{gather_url}" method="POST" />
+</Response>"""
+
 if __name__ == "__main__":
     import socket
     port = int(os.getenv("PORT", 5000))
