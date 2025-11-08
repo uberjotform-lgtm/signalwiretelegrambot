@@ -8,43 +8,41 @@ app = Flask(__name__)
 # =========================
 #   إعدادات من Environment
 # =========================
-SW_PROJECT = os.getenv("SIGNALWIRE_PROJECT")
-SW_TOKEN   = os.getenv("SIGNALWIRE_TOKEN")
-# ملاحظة: مكتبة signalwire تتوقع SIGNALWIRE_SPACE_URL موجود بالـ HTTPS
-# مثال: https://yourspace.signalwire.com
-SW_SPACE_URL = os.getenv("SIGNALWIRE_SPACE_URL")
-
-SW_FROM     = os.getenv("SIGNALWIRE_NUMBER")      # رقمك على SignalWire بصيغة دولية +1...
-TG_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN")
-TG_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
+SW_PROJECT   = os.getenv("SIGNALWIRE_PROJECT")
+SW_TOKEN     = os.getenv("SIGNALWIRE_TOKEN")
+SW_SPACE_URL = os.getenv("SIGNALWIRE_SPACE_URL")   # لازم تكون بالشكل: https://yourspace.signalwire.com
+SW_FROM      = os.getenv("SIGNALWIRE_NUMBER")      # رقم SignalWire بصيغة دولية +1...
+TG_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN")
+TG_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}" if TG_TOKEN else ""
 
-def required_env_ok():
-    missing = [k for k, v in {
-        "SIGNALWIRE_PROJECT": SW_PROJECT,
-        "SIGNALWIRE_TOKEN": SW_TOKEN,
-        "SIGNALWIRE_SPACE_URL": SW_SPACE_URL,
-        "SIGNALWIRE_NUMBER": SW_FROM,
-        "TELEGRAM_BOT_TOKEN": TG_TOKEN,
-        "TELEGRAM_CHAT_ID": TG_CHAT_ID,
-    }.items() if not v]
-    return missing
-
-def get_sw_client():
-    # المكتبة تقرأ SW_SPACE_URL داخليًا — يكفي توافره كمتغير بيئة
-    return SignalWireClient(SW_PROJECT, SW_TOKEN)
-
-def send_tg(text):
+def send_tg(text: str):
+    """إرسال رسالة نصية إلى تيليجرام."""
     try:
         if TG_API and TG_CHAT_ID:
             requests.post(f"{TG_API}/sendMessage", data={"chat_id": TG_CHAT_ID, "text": text})
     except Exception:
         pass
 
+def missing_env():
+    req = {
+        "SIGNALWIRE_PROJECT": SW_PROJECT,
+        "SIGNALWIRE_TOKEN": SW_TOKEN,
+        "SIGNALWIRE_SPACE_URL": SW_SPACE_URL,
+        "SIGNALWIRE_NUMBER": SW_FROM,
+        "TELEGRAM_BOT_TOKEN": TG_TOKEN,
+        "TELEGRAM_CHAT_ID": TG_CHAT_ID,
+    }
+    return [k for k, v in req.items() if not v]
+
+def get_sw_client():
+    # مكتبة signalwire (v2.x) بتقرأ SIGNALWIRE_SPACE_URL داخليًا — يكفي وجوده كمتغيّر بيئة
+    return SignalWireClient(SW_PROJECT, SW_TOKEN)
+
 @app.route("/")
 def home():
-    miss = required_env_ok()
+    miss = missing_env()
     if miss:
         return f"Running, but missing env vars: {', '.join(miss)}", 500
     return "SignalWire + Telegram Bot is Running ✅", 200
@@ -54,7 +52,7 @@ def home():
 # =========================
 @app.route("/telegram/webhook", methods=["POST"])
 def telegram_webhook():
-    miss = required_env_ok()
+    miss = missing_env()
     if miss:
         return f"Missing env vars: {', '.join(miss)}", 500
 
@@ -65,7 +63,6 @@ def telegram_webhook():
     if not text:
         return "ok"
 
-    # أمر اختبار بسيط
     if text.lower() in ("/start", "/ping"):
         send_tg("البوت شغال ✅\nاكتب: /call +2010xxxxxxx")
         return "ok"
@@ -87,15 +84,13 @@ def telegram_webhook():
                 to=to_number,
                 url=f"{base}/voice/outbound-start",
                 status_callback=f"{base}/voice/status",
-                # استخدم فقط الأحداث المدعومة:
-                status_callback_event=["initiated", "ringing", "answered", "completed"]
+                method="POST"  # مهم: POST
             )
             send_tg(f"📤 بدء مكالمة مع {to_number}\nCallSid: {call.sid}")
         except Exception as e:
             send_tg(f"❌ فشل بدء المكالمة: {e}")
         return "ok"
 
-    # غير ذلك: تجاهل بهدوء
     return "ok"
 
 # =========================
@@ -104,10 +99,10 @@ def telegram_webhook():
 @app.route("/voice/outbound-start", methods=["POST"])
 def outbound_start():
     base = request.host_url.rstrip('/')
-    # Gather برابط مطلق لضمان وصول POST حتى خلف البروكسي
+    # نستخدم URL مطلق في action لضمان وصول POST من خلف البروكسي
     return f"""<Response>
   <Say language="ar-EG">مرحبًا، شكرًا لاتصالك. اضغط واحد لرسالة النادي، أو اثنين لرسالة الشركة.</Say>
-  <Gather input="dtmf speech" timeout="5" numDigits="1" action="{base}/voice/gather" />
+  <Gather input="dtmf speech" timeout="5" numDigits="1" action="{base}/voice/gather" method="POST" />
 </Response>"""
 
 @app.route("/voice/gather", methods=["POST"])
@@ -133,10 +128,14 @@ def gather():
 
 @app.route("/voice/status", methods=["POST"])
 def status():
-    # SignalWire سترسل حالات مختلفة؛ عند النهاية CallStatus قد يكون completed/busy/failed/no-answer...
+    # SignalWire سترسل حالات متعددة؛ عند النهاية CallStatus قد يكون completed/busy/failed/no-answer...
     sid   = request.form.get("CallSid")
     st    = request.form.get("CallStatus")
-    from_ = request.form.get("From")
+    frm   = request.form.get("From")
     to    = request.form.get("To")
-    send_tg(f"📊 حالة المكالمة: {st}\nFrom: {from_}\nTo: {to}\nCallSid: {sid}")
+    send_tg(f"📊 حالة المكالمة: {st}\nFrom: {frm}\nTo: {to}\nCallSid: {sid}")
     return "ok"
+
+# تشغيل محليًا فقط (Render يستخدم gunicorn من Procfile)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
