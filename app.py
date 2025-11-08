@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 from flask import Flask, request
 from signalwire.rest import Client as SignalWireClient
@@ -10,15 +11,17 @@ app = Flask(__name__)
 # =========================
 SW_PROJECT   = os.getenv("SIGNALWIRE_PROJECT")
 SW_TOKEN     = os.getenv("SIGNALWIRE_TOKEN")
-SW_SPACE_URL = os.getenv("SIGNALWIRE_SPACE_URL")   # لازم تكون بالشكل: https://yourspace.signalwire.com
+SW_SPACE_URL = os.getenv("SIGNALWIRE_SPACE_URL")   # مثال: https://yourspace.signalwire.com
 SW_FROM      = os.getenv("SIGNALWIRE_NUMBER")      # رقم SignalWire بصيغة دولية +1...
 TG_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN")
 TG_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}" if TG_TOKEN else ""
 
+# تحويل الأرقام العربية إلى إنجليزية
+AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
 def send_tg(text: str):
-    """إرسال رسالة نصية إلى تيليجرام."""
     try:
         if TG_API and TG_CHAT_ID:
             requests.post(f"{TG_API}/sendMessage", data={"chat_id": TG_CHAT_ID, "text": text})
@@ -37,8 +40,40 @@ def missing_env():
     return [k for k, v in req.items() if not v]
 
 def get_sw_client():
-    # مكتبة signalwire (v2.x) بتقرأ SIGNALWIRE_SPACE_URL داخليًا — يكفي وجوده كمتغيّر بيئة
+    # مكتبة signalwire تقرأ SIGNALWIRE_SPACE_URL من البيئة تلقائيًا
     return SignalWireClient(SW_PROJECT, SW_TOKEN)
+
+def to_e164(user_input: str, default_cc="+20"):
+    """
+    يطبع الرقم لصيغة E.164:
+    - يشيل مسافات/شرطات/أقواس
+    - يحوّل أرقام عربية لإنجليزية
+    - يتعامل مع 00 / + / 0 المحلية (لمصر +20 كافتراضي)
+    """
+    if not user_input:
+        return None
+    s = user_input.strip().translate(AR_DIGITS)
+    # شيل أي شيء غير + أو أرقام
+    s = re.sub(r"[^\d+]", "", s)
+
+    # لو بدأ بـ + وخلاص
+    if s.startswith("+"):
+        return s
+
+    # لو بدأ بـ 00.. حوّل لأول + ثم باقي الأرقام
+    if s.startswith("00"):
+        return "+" + s[2:]
+
+    # لو رقم محلي يبدأ بصفر (مثلاً 01xxxxxxxxx في مصر)
+    if s.startswith("0"):
+        return default_cc + s[1:]
+
+    # لو أرقام فقط بدون + ولا 00 (نعتبره محلي لمصر)
+    if re.fullmatch(r"\d+", s):
+        # لو بيبدأ بـ1 ومكوَّن من 10 أو 11 رقم، نخمن مصر موبايل: ضيف +20
+        return default_cc + s
+
+    return None
 
 @app.route("/")
 def home():
@@ -64,19 +99,24 @@ def telegram_webhook():
         return "ok"
 
     if text.lower() in ("/start", "/ping"):
-        send_tg("البوت شغال ✅\nاكتب: /call +2010xxxxxxx")
+        send_tg("البوت شغال ✅\nاكتب: /call 01xxxxxxxxx أو /call +2010xxxxxxx")
         return "ok"
 
-    # /call +2010xxxxxxx
+    # /call <number>
     if text.lower().startswith("/call"):
-        parts = text.split()
+        parts = text.split(maxsplit=1)
         if len(parts) < 2:
-            send_tg("📞 اكتب بالشكل: /call +2010xxxxxxx")
+            send_tg("📞 اكتب بالشكل: /call 01xxxxxxxxx أو /call +2010xxxxxxx")
             return "ok"
 
-        to_number = parts[1]
-        base = request.host_url.rstrip('/')
+        # طبّع الرقم لصيغة دولية
+        raw = parts[1]
+        to_number = to_e164(raw, default_cc="+20")
+        if not to_number or not to_number.startswith("+"):
+            send_tg(f"❌ الرقم غير صحيح: {raw}\nجرّب بالشكل: +2010xxxxxxx أو 01xxxxxxxxx")
+            return "ok"
 
+        base = request.host_url.rstrip('/')
         try:
             client = get_sw_client()
             call = client.calls.create(
@@ -84,7 +124,7 @@ def telegram_webhook():
                 to=to_number,
                 url=f"{base}/voice/outbound-start",
                 status_callback=f"{base}/voice/status",
-                method="POST"  # مهم: POST
+                method="POST"
             )
             send_tg(f"📤 بدء مكالمة مع {to_number}\nCallSid: {call.sid}")
         except Exception as e:
@@ -99,7 +139,6 @@ def telegram_webhook():
 @app.route("/voice/outbound-start", methods=["POST"])
 def outbound_start():
     base = request.host_url.rstrip('/')
-    # نستخدم URL مطلق في action لضمان وصول POST من خلف البروكسي
     return f"""<Response>
   <Say language="ar-EG">مرحبًا، شكرًا لاتصالك. اضغط واحد لرسالة النادي، أو اثنين لرسالة الشركة.</Say>
   <Gather input="dtmf speech" timeout="5" numDigits="1" action="{base}/voice/gather" method="POST" />
@@ -128,7 +167,6 @@ def gather():
 
 @app.route("/voice/status", methods=["POST"])
 def status():
-    # SignalWire سترسل حالات متعددة؛ عند النهاية CallStatus قد يكون completed/busy/failed/no-answer...
     sid   = request.form.get("CallSid")
     st    = request.form.get("CallStatus")
     frm   = request.form.get("From")
@@ -136,6 +174,9 @@ def status():
     send_tg(f"📊 حالة المكالمة: {st}\nFrom: {frm}\nTo: {to}\nCallSid: {sid}")
     return "ok"
 
-# تشغيل محليًا فقط (Render يستخدم gunicorn من Procfile)
+# للتشغيل المحلي فقط
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    import socket
+    port = int(os.getenv("PORT", 5000))
+    print(f"Running on http://0.0.0.0:{port} (host: {socket.gethostname()})")
+    app.run(host="0.0.0.0", port=port)
